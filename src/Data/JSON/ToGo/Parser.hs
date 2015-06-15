@@ -4,9 +4,11 @@ module Data.JSON.ToGo.Parser where
 
 import Prelude hiding (sequence)
 
+import Data.Aeson (FromJSON, parseJSON)
 import Data.Aeson.Parser (jstring, value)
-import Data.Aeson.Types (Value)
-import Data.Attoparsec.ByteString.Char8 (skipSpace, char, string, scientific, parse)
+import Data.Aeson.Types (Value, parseEither)
+import Data.Attoparsec.ByteString.Char8 (skipSpace, char, string, scientific)
+import qualified Data.Attoparsec.ByteString.Char8 as Atto
 import Data.ByteString (ByteString)
 import Data.Monoid (Monoid, mempty, (<>))
 import Data.Scientific (Scientific)
@@ -18,7 +20,7 @@ import Control.Monad.Trans.Parser (ParserT, liftP)
 
 type ParserM = ParserT ByteString
 
-rP p = liftP . parse $ skipSpace >> p
+rP p = liftP . Atto.parse $ skipSpace >> p
 
 parray :: (Monad m, Monoid r) => (Int -> ParserM m r) -> ParserM m r
 parray f = rP (char '[') >> go 0 mempty
@@ -63,3 +65,8 @@ pstring = rP jstring
 
 pvalue :: Monad m => ParserM m Value
 pvalue = rP value
+
+parse :: (Monad m, FromJSON a) => ParserM m a
+parse = fmap (parseEither parseJSON) pvalue >>= unwrap
+  where unwrap (Left s) = fail s
+        unwrap (Right r) = return r
