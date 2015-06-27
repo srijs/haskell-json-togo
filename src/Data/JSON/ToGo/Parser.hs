@@ -66,6 +66,9 @@ pstring = rP jstring
 pvalue :: Monad m => ParserM m Value
 pvalue = rP value
 
+pskip :: Monad m => ParserM m ()
+pskip = rP $ () <$ value
+
 parse :: (Monad m, FromJSON a) => ParserM m a
 parse = fmap (parseEither parseJSON) pvalue >>= unwrap
   where unwrap (Left s) = fail s
