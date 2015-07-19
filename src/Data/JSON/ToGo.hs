@@ -1,7 +1,12 @@
+{-# LANGUAGE DeriveFunctor #-}
+
 module Data.JSON.ToGo
-  ( ValueM(..)
-  , applyV, applyV_
-  , applyP, applyP_
+  ( Expr
+  , evalToParser, evalToParser_
+  , evalWithValue
+  , matchNull, matchAny
+  , matchBool, matchNumber, matchString
+  , matchArray, matchObject
   ) where
 
 import Data.JSON.ToGo.Parser
@@ -13,55 +18,82 @@ import Data.Text (Text)
 import qualified Data.Vector as V
 import qualified Data.HashMap.Strict as H
 
-import Control.Monad (MonadPlus, mzero, msum)
+import Control.Monad (void, MonadPlus, mzero, msum)
 import Control.Monad.Trans.Class (lift)
 
-data ValueM m a
+data ExprF m a r
   = NullM   (m a)
   | BoolM   (Bool -> m a)
   | NumberM (Scientific -> m a)
   | StringM (Text -> m a)
-  | ArrayM  (Int -> ValueM m a)
-  | ObjectM (Text -> ValueM m a)
+  | ArrayM  (Int -> r)
+  | ObjectM (Text -> r)
   | AnyM    (Value -> m a)
+  deriving Functor
 
-instance Monad m => Functor (ValueM m) where
-  fmap g (NullM ma)  = NullM   $ ma >>= return.g
-  fmap g (BoolM f)   = BoolM   $ fmap (>>= return.g) f
-  fmap g (NumberM f) = NumberM $ fmap (>>= return.g) f
-  fmap g (StringM f) = StringM $ fmap (>>= return.g) f
-  fmap g (ArrayM f)  = ArrayM  $ fmap (fmap g) f
-  fmap g (ObjectM f) = ObjectM $ fmap (fmap g) f
-  fmap g (AnyM f)    = AnyM    $ fmap (>>= return.g) f
+newtype Fix f = Fix { unFix :: f (Fix f) }
 
-applyV :: MonadPlus m => ValueM m a -> Value -> m a
-applyV (NullM ma)  Null       = ma
-applyV (BoolM f)   (Bool b)   = f b
-applyV (NumberM f) (Number n) = f n
-applyV (StringM f) (String s) = f s
-applyV (ArrayM f)  (Array v)  = msum $ map (uncurry (applyV . f)) (V.toList $ V.indexed v)
-applyV (ObjectM f) (Object h) = msum $ map (uncurry (applyV . f)) (H.toList h)
-applyV (AnyM f)    v          = f v
-applyV _           _          = mzero
+type Algebra f a = f a -> a
 
-applyV_ :: Monad m => ValueM m a -> Value -> m ()
-applyV_ (NullM ma)  Null         = ma >> return ()
-applyV_ (BoolM f)   (Bool b)     = f b >> return ()
-applyV_ (NumberM f) (Number n)   = f n >> return ()
-applyV_ (StringM f) (String s)   = f s >> return ()
-applyV_ (ArrayM f)  (Array v)    = mapM_ (uncurry (applyV_ . f)) (V.toList $ V.indexed v)
-applyV_ (ObjectM f) (Object ias) = mapM_ (uncurry (applyV_ . f)) (H.toList ias)
-applyV_ (AnyM f)    v            = f v >> return ()
-applyV_ _           _            = return ()
+cata :: Functor f => Algebra f a -> Fix f -> a
+cata f = f . fmap (cata f) . unFix
 
-applyP :: (Monad m, Monoid r) => ValueM m r -> ParserM m r
-applyP (ArrayM f)  = parray  (applyP.f)
-applyP (ObjectM f) = pobject (applyP.f)
-applyP (NullM m)   = pbool   >>  lift m
-applyP (BoolM f)   = pbool   >>= lift.f
-applyP (NumberM f) = pnumber >>= lift.f
-applyP (StringM f) = pstring >>= lift.f
-applyP (AnyM f)    = pvalue  >>= lift.f
+newtype Expr m a = Expr { getFix :: Fix (ExprF m a) }
 
-applyP_ :: Monad m => ValueM m a -> ParserM m ()
-applyP_ = applyP . fmap (const ())
+alg :: (Monad m, Monoid a) => Algebra (ExprF m a) (ParserM m a)
+alg (NullM m) = lift m
+alg (BoolM f) = pbool >>= lift . f
+alg (NumberM f) = pnumber >>= lift . f
+alg (StringM f) = pstring >>= lift . f
+alg (AnyM f) = pvalue >>= lift . f
+alg (ArrayM f) = parray f
+alg (ObjectM f) = pobject f
+
+alg_ :: (Monad m) => Algebra (ExprF m a) (ParserM m ())
+alg_ (NullM m) = void $ lift m
+alg_ (BoolM f) = void $ pbool >>= lift . f
+alg_ (NumberM f) = void $ pnumber >>= lift . f
+alg_ (StringM f) = void $ pstring >>= lift . f
+alg_ (AnyM f) = void $ pvalue >>= lift . f
+alg_ (ArrayM f) = parray_ f
+alg_ (ObjectM f) = pobject_ f
+
+valueAlg :: (MonadPlus m) => Algebra (ExprF m a) (Value -> m a)
+valueAlg (NullM m) Null = m
+valueAlg (BoolM f) (Bool b) = f b
+valueAlg (NumberM f) (Number n) = f n
+valueAlg (StringM f) (String s) = f s
+valueAlg (AnyM f) v = f v
+valueAlg (ArrayM f) (Array v) = msum . map (uncurry f) . V.toList $ V.indexed v
+valueAlg (ObjectM f) (Object h) = msum . map (uncurry f) $ H.toList h
+valueAlg _ _ = mzero
+
+evalToParser :: (Monad m, Monoid a) => Expr m a -> ParserM m a
+evalToParser = cata alg . getFix
+
+evalToParser_ :: (Monad m) => Expr m a -> ParserM m ()
+evalToParser_ = cata alg_ . getFix
+
+evalWithValue :: (MonadPlus m) => Expr m a -> Value -> m a
+evalWithValue = cata valueAlg . getFix
+
+matchNull :: m a -> Expr m a
+matchNull = Expr . Fix . NullM
+
+matchBool :: (Bool -> m a) -> Expr m a
+matchBool = Expr . Fix . BoolM
+
+matchNumber :: (Scientific -> m a) -> Expr m a
+matchNumber = Expr . Fix . NumberM
+
+matchString :: (Text -> m a) -> Expr m a
+matchString = Expr . Fix . StringM
+
+matchAny :: (Value -> m a) -> Expr m a
+matchAny = Expr . Fix . AnyM
+
+matchArray :: (Int -> Expr m a) -> Expr m a
+matchArray = Expr . Fix . ArrayM . fmap getFix
+
+matchObject :: (Text -> Expr m a) -> Expr m a
+matchObject = Expr . Fix . ObjectM . fmap getFix
